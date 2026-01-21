@@ -1,0 +1,44 @@
+# Credentials and secrets
+credentials/
+*.txt
+aws_credentials.txt
+gcp_credentials.txt
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+terraform/cluster-info.json
+terraform/CLUSTER_ACCESS.txt
+
+# SSH keys
+*.pem
+*.key
+id_rsa*
+
+# AWS
+.aws/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

@@ -1,0 +1,170 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-dev-setup-enhanced
+data:
+  setup.sh: |
+    #!/bin/bash
+    set -e
+
+    echo "========================================="
+    echo "Setting up GPU Development Environment"
+    echo "========================================="
+
+    # Update package list
+    apt-get update
+
+    # Install essential tools
+    echo "Installing essential packages..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        openssh-server \
+        sudo \
+        vim \
+        git \
+        curl \
+        wget \
+        htop \
+        nvtop \
+        tmux \
+        build-essential \
+        python3 \
+        python3-pip \
+        python3-dev
+
+    # Setup SSH
+    mkdir -p /run/sshd /root/.ssh
+    chmod 700 /root/.ssh
+    chmod 755 /run/sshd
+
+    # Copy authorized keys
+    if [ -f /ssh-keys/authorized_keys ]; then
+        cp /ssh-keys/authorized_keys /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+    fi
+
+    # Configure SSH
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+    sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+    # Generate host keys
+    ssh-keygen -A
+
+    # Install Python packages for ML/AI
+    echo "Installing Python packages..."
+    pip3 install --no-cache-dir \
+        torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 \
+        transformers \
+        accelerate \
+        numpy \
+        pandas \
+        jupyter \
+        ipython
+
+    # Setup workspace
+    mkdir -p /workspace
+    cd /workspace
+
+    # Create a welcome message
+    cat > /etc/motd << 'EOF'
+========================================
+   GPU Development Environment
+========================================
+GPU Info: Run 'nvidia-smi'
+Python: python3
+Pip: pip3
+Workspace: /workspace
+
+Installed tools:
+- PyTorch with CUDA support
+- Transformers (Hugging Face)
+- Jupyter
+- Git, tmux, vim
+
+Get started:
+  cd /workspace
+  python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+
+========================================
+EOF
+
+    echo "Setup complete!"
+    echo "Starting SSH service..."
+
+    # Start SSH
+    /usr/sbin/sshd -D
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-dev-ssh-enhanced
+spec:
+  type: LoadBalancer
+  selector:
+    app: gpu-dev-enhanced
+  ports:
+    - name: ssh
+      port: 22
+      targetPort: 22
+      protocol: TCP
+    - name: jupyter
+      port: 8888
+      targetPort: 8888
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-dev-pod-enhanced
+  labels:
+    app: gpu-dev-enhanced
+spec:
+  containers:
+  - name: gpu-dev
+    image: nvidia/cuda:12.3.1-devel-ubuntu22.04
+    command: ["/bin/bash", "/config/setup.sh"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+        memory: "16Gi"
+        cpu: "4"
+      requests:
+        nvidia.com/gpu: 1
+        memory: "8Gi"
+        cpu: "2"
+    volumeMounts:
+    - name: workspace
+      mountPath: /workspace
+    - name: setup-script
+      mountPath: /config
+    - name: ssh-keys
+      mountPath: /ssh-keys
+      readOnly: true
+    env:
+    - name: NVIDIA_VISIBLE_DEVICES
+      value: "all"
+    - name: NVIDIA_DRIVER_CAPABILITIES
+      value: "compute,utility"
+    ports:
+    - containerPort: 22
+      name: ssh
+    - containerPort: 8888
+      name: jupyter
+    securityContext:
+      capabilities:
+        add:
+        - SYS_ADMIN
+  volumes:
+  - name: workspace
+    emptyDir:
+      sizeLimit: 50Gi
+  - name: setup-script
+    configMap:
+      name: gpu-dev-setup-enhanced
+      defaultMode: 0755
+  - name: ssh-keys
+    secret:
+      secretName: gpu-dev-ssh-keys
+      defaultMode: 0600
+  restartPolicy: Always

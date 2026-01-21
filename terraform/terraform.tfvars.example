@@ -1,0 +1,58 @@
+# Example Terraform Variables for Los Alamos SLURM GPU Cluster
+# Copy this file to terraform.tfvars and customize
+
+# Basic Configuration
+# ==========================================
+project_name = "los-alamos-testing"
+environment  = "dev"
+aws_region   = "us-west-2"
+
+# Instance Configuration
+# ==========================================
+# Options:
+#   T4 GPUs:  g4dn.xlarge (4 vCPUs, 16GB RAM, ~$0.52/hr)
+#   T4 GPUs:  g4dn.2xlarge (8 vCPUs, 32GB RAM, ~$0.75/hr)
+#   L4 GPUs:  g6.2xlarge (8 vCPUs, 32GB RAM, ~$1.10/hr)
+#   L4 GPUs:  g6.4xlarge (16 vCPUs, 64GB RAM, ~$1.64/hr)
+
+head_node_instance_type   = "g4dn.xlarge"
+worker_node_instance_type = "g4dn.xlarge"
+worker_node_count         = 2  # 2-4 recommended
+
+# Network Configuration
+# ==========================================
+vpc_cidr           = "10.0.0.0/16"
+public_subnet_cidr = "10.0.1.0/24"
+
+# Security Configuration
+# ==========================================
+# ⚠️  IMPORTANT: Restrict SSH access to your IP!
+# Find your IP: curl ifconfig.me
+ssh_allowed_cidr = "0.0.0.0/0"  # WARNING: Open to all - change this!
+# Example: ssh_allowed_cidr = "203.0.113.0/32"  # Your IP only
+
+# SSH Key
+# ==========================================
+# Leave empty to use ~/.ssh/id_rsa.pub (default)
+# Or specify existing EC2 key pair name
+ssh_key_name        = ""
+ssh_public_key_path = "~/.ssh/id_rsa.pub"
+
+# Storage Configuration
+# ==========================================
+# Use existing S3 bucket
+s3_model_bucket = "littleboy-dev-models-752105082763"
+
+# EFS performance mode
+efs_performance_mode = "generalPurpose"  # or "maxIO" for parallel workloads
+
+# Resource Tags
+# ==========================================
+tags = {
+  Project     = "LosAlamos"
+  Environment = "dev"
+  ManagedBy   = "Terraform"
+  Purpose     = "SLURM-GPU-Testing"
+  Owner       = "DevOps-Team"
+  CostCenter  = "Engineering"
+}

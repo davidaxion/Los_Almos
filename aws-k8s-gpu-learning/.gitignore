@@ -1,0 +1,45 @@
+# AWS
+.aws/
+*.pem
+*.key
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+
+# SSH Keys
+id_rsa
+id_rsa.pub
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Terraform (if you add it later)
+.terraform/
+*.tfstate
+*.tfstate.*

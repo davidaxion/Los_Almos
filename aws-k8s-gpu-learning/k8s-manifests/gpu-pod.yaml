@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-dev-setup
+data:
+  setup.sh: |
+    #!/bin/bash
+    # Setup script that runs on pod start
+    echo "Setting up GPU development environment..."
+
+    # Create user directory
+    mkdir -p /workspace
+
+    # Setup SSH
+    mkdir -p /run/sshd
+    chmod 755 /run/sshd
+
+    # Generate host keys if they don't exist
+    if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
+        ssh-keygen -A
+    fi
+
+    # Start SSH service
+    /usr/sbin/sshd -D -e &
+
+    # Keep container running
+    tail -f /dev/null
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-dev-ssh
+spec:
+  type: LoadBalancer
+  selector:
+    app: gpu-dev
+  ports:
+    - name: ssh
+      port: 22
+      targetPort: 22
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-dev-pod
+  labels:
+    app: gpu-dev
+spec:
+  containers:
+  - name: gpu-dev
+    image: nvidia/cuda:12.3.1-devel-ubuntu22.04
+    command: ["/bin/bash", "/config/setup.sh"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1  # Request 1 GPU
+    volumeMounts:
+    - name: workspace
+      mountPath: /workspace
+    - name: setup-script
+      mountPath: /config
+    - name: ssh-keys
+      mountPath: /root/.ssh
+      readOnly: true
+    env:
+    - name: NVIDIA_VISIBLE_DEVICES
+      value: "all"
+    - name: NVIDIA_DRIVER_CAPABILITIES
+      value: "compute,utility"
+    ports:
+    - containerPort: 22
+      name: ssh
+    securityContext:
+      capabilities:
+        add:
+        - SYS_ADMIN
+        - NET_ADMIN
+  volumes:
+  - name: workspace
+    emptyDir: {}
+  - name: setup-script
+    configMap:
+      name: gpu-dev-setup
+      defaultMode: 0755
+  - name: ssh-keys
+    secret:
+      secretName: gpu-dev-ssh-keys
+      defaultMode: 0600
+  restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gpu-dev-ssh-keys
+type: Opaque
+stringData:
+  authorized_keys: |
+    # Add your SSH public key here
+    # Example: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC... user@host
+    # This will be replaced by the setup script
