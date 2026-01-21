@@ -42,3 +42,10 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Research binaries (too large for GitHub)
+shared/research/**/*.o
+shared/research/**/*.so
+shared/research/**/terraform-provider-*
+shared/research/**/.terraform/
+shared/research/**/terraform.tfstate*

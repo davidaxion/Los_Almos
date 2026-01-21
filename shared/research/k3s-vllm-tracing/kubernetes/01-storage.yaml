@@ -1,0 +1,30 @@
+# Persistent storage for eBPF trace files
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-traces
+  namespace: vllm-tracing
+  labels:
+    app: vllm
+    component: tracing
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-path  # K3s default storage class
+---
+# ConfigMap for S3 configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-tracing-config
+  namespace: vllm-tracing
+data:
+  # S3 bucket configuration (override via environment variables)
+  S3_BUCKET: "littleboy-research-traces"
+  S3_PREFIX: "k3s-vllm/"
+  TRACE_INTERVAL: "60"
+  TARGET_PROCESS: "python"
+  UPLOAD_ENABLED: "true"

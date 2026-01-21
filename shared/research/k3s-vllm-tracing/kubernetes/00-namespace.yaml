@@ -1,0 +1,9 @@
+# Namespace for vLLM inference workload with eBPF tracing
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vllm-tracing
+  labels:
+    app: vllm
+    component: inference
+    tracing: ebpf

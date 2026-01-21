@@ -1,0 +1,132 @@
+#!/usr/bin/env bpftrace
+/*
+ * trace_all_cuda.bt - Generic CUDA API Tracer
+ *
+ * Automatically hooks ALL CUDA functions using eBPF uprobes.
+ * No need to hardcode function names - wildcards match everything!
+ *
+ * Usage:
+ *   sudo bpftrace trace_all_cuda.bt
+ *   (then run your CUDA program in another terminal)
+ *
+ * Or trace specific PID:
+ *   sudo bpftrace trace_all_cuda.bt -p <pid>
+ */
+
+BEGIN {
+    printf("=== CUDA API Tracer Started ===\n");
+    printf("Tracing all cu* functions in libcuda.so\n");
+    printf("Press Ctrl-C to stop\n\n");
+    printf("%-10s %-8s %-6s %-40s %-10s\n",
+           "TIME(ms)", "TID", "DEPTH", "FUNCTION", "DURATION");
+}
+
+// Hook all functions starting with "cu" in libcuda.so
+uprobe:/lib/x86_64-linux-gnu/libcuda.so*:cu*,
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cu*,
+uprobe:/usr/local/cuda/lib64/libcuda.so*:cu*
+{
+    // Store entry timestamp and increment depth
+    @entry_ts[tid, probe] = nsecs;
+    @depth[tid]++;
+
+    // Print function entry
+    printf("%-10u %-8d %-6d → %-40s\n",
+           (nsecs - @start_ts) / 1000000,  // Time since start in ms
+           tid,
+           @depth[tid],
+           probe);
+}
+
+// Hook all function returns
+uretprobe:/lib/x86_64-linux-gnu/libcuda.so*:cu*,
+uretprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cu*,
+uretprobe:/usr/local/cuda/lib64/libcuda.so*:cu*
+{
+    $entry = @entry_ts[tid, probe];
+
+    if ($entry > 0) {
+        $duration = (nsecs - $entry) / 1000;  // Duration in microseconds
+
+        // Print function exit with duration
+        printf("%-10u %-8d %-6d ← %-40s %-10u μs\n",
+               (nsecs - @start_ts) / 1000000,
+               tid,
+               @depth[tid],
+               probe,
+               $duration);
+
+        // Track statistics
+        @call_count[probe]++;
+        @total_time[probe] = @total_time[probe] + $duration;
+
+        delete(@entry_ts[tid, probe]);
+    }
+
+    @depth[tid]--;
+}
+
+// Track memory operations specifically
+uprobe:/lib/x86_64-linux-gnu/libcuda.so*:cuMemAlloc,
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cuMemAlloc
+{
+    // arg1 is the size being allocated
+    @mem_allocs++;
+    @total_mem_allocated = @total_mem_allocated + arg1;
+    printf("  [MEM] Allocating %lu bytes\n", arg1);
+}
+
+uprobe:/lib/x86_64-linux-gnu/libcuda.so*:cuMemcpy*,
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cuMemcpy*
+{
+    @mem_copies++;
+    printf("  [COPY] Transferring data\n");
+}
+
+uprobe:/lib/x86_64-linux-gnu/libcuda.so*:cuLaunchKernel,
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cuLaunchKernel
+{
+    @kernel_launches++;
+    printf("  [KERNEL] Grid(%u,%u,%u) Block(%u,%u,%u)\n",
+           arg1, arg2, arg3,  // gridDim
+           arg4, arg5, arg6); // blockDim
+}
+
+END {
+    printf("\n=== CUDA API Tracer Summary ===\n\n");
+
+    printf("Total kernel launches: %lu\n", @kernel_launches);
+    printf("Total memory allocations: %lu\n", @mem_allocs);
+    printf("Total memory allocated: %lu bytes (%.2f MB)\n",
+           @total_mem_allocated,
+           @total_mem_allocated / 1048576.0);
+    printf("Total memory copies: %lu\n\n", @mem_copies);
+
+    printf("Top 20 functions by call count:\n");
+    print(@call_count, 20);
+
+    printf("\nTop 20 functions by total time:\n");
+    print(@total_time, 20);
+
+    printf("\nAverage time per function (top 20):\n");
+    clear(@avg_time);
+    map(@avg_time, @total_time / @call_count);
+    print(@avg_time, 20);
+
+    // Cleanup
+    clear(@entry_ts);
+    clear(@depth);
+    clear(@call_count);
+    clear(@total_time);
+    clear(@avg_time);
+    clear(@kernel_launches);
+    clear(@mem_allocs);
+    clear(@mem_copies);
+    clear(@total_mem_allocated);
+    clear(@start_ts);
+}
+
+// Store global start time
+BEGIN {
+    @start_ts = nsecs;
+}

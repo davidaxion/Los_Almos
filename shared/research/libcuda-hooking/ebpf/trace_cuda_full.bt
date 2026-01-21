@@ -1,0 +1,357 @@
+#!/usr/bin/env bpftrace
+/*
+ * trace_cuda_full.bt - Comprehensive CUDA Tracing with eBPF
+ *
+ * Traces BOTH userspace (libcuda.so) and kernel space (nvidia.ko)
+ * to show the complete pipeline from API call to GPU driver.
+ *
+ * Features:
+ *   - Automatic hooking of ALL cu* functions
+ *   - Kernel driver IOCTL tracing
+ *   - Call depth tracking
+ *   - Timing measurements
+ *   - Memory tracking
+ *   - Outputs JSON for easy parsing
+ *
+ * Usage:
+ *   sudo bpftrace trace_cuda_full.bt -o trace.json
+ *   sudo bpftrace trace_cuda_full.bt -p <pid>  # Attach to specific process
+ *
+ * Output Format: JSON Lines (one event per line)
+ */
+
+BEGIN {
+    printf("=== CUDA Full-Stack Tracer (eBPF) ===\n");
+    printf("Tracing userspace + kernel space\n");
+    printf("Time: %s\n", strftime("%Y-%m-%d %H:%M:%S", nsecs));
+    printf("Press Ctrl-C to stop and show summary\n\n");
+
+    @start_time = nsecs;
+    @event_id = 0;
+}
+
+//
+// USERSPACE HOOKS - libcuda.so
+//
+// Hook all functions starting with "cu" in libcuda.so
+// This uses wildcards to automatically match ALL CUDA functions
+
+uprobe:/lib/x86_64-linux-gnu/libcuda.so*:cu*,
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cu*,
+uprobe:/usr/lib64/libcuda.so*:cu*,
+uprobe:/usr/local/cuda/lib64/libcuda.so*:cu*
+{
+    // Allocate unique event ID
+    $event_id = @event_id;
+    @event_id++;
+
+    // Track call depth per thread
+    @depth[tid]++;
+
+    // Store entry timestamp
+    @entry_ts[tid, probe] = nsecs;
+
+    // Get relative timestamp
+    $ts = (nsecs - @start_time) / 1000000.0;  // milliseconds
+
+    // Extract just the function name from probe
+    $probe_str = str(probe);
+
+    // Output JSON event
+    printf("{\"event_id\":%d,\"ts\":%.6f,\"tid\":%d,\"phase\":\"B\",\"type\":\"userspace\",\"name\":\"%s\",\"depth\":%d}\n",
+           $event_id, $ts, tid, $probe_str, @depth[tid]);
+
+    // Track statistics
+    @userspace_calls++;
+}
+
+uretprobe:/lib/x86_64-linux-gnu/libcuda.so*:cu*,
+uretprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cu*,
+uretprobe:/usr/lib64/libcuda.so*:cu*,
+uretprobe:/usr/local/cuda/lib64/libcuda.so*:cu*
+{
+    // Get entry timestamp
+    $entry = @entry_ts[tid, probe];
+
+    if ($entry > 0) {
+        $event_id = @event_id;
+        @event_id++;
+
+        $duration = (nsecs - $entry) / 1000.0;  // microseconds
+        $ts = (nsecs - @start_time) / 1000000.0;
+
+        $probe_str = str(probe);
+
+        printf("{\"event_id\":%d,\"ts\":%.6f,\"tid\":%d,\"phase\":\"E\",\"type\":\"userspace\",\"name\":\"%s\",\"depth\":%d,\"duration_us\":%.3f,\"retval\":%d}\n",
+               $event_id, $ts, tid, $probe_str, @depth[tid], $duration, retval);
+
+        // Accumulate timing stats per function
+        @total_time[probe] = @total_time[probe] + $duration;
+        @call_count[probe]++;
+
+        // Clean up
+        delete(@entry_ts[tid, probe]);
+        @depth[tid]--;
+    }
+}
+
+//
+// MEMORY ALLOCATION TRACKING
+//
+
+uprobe:/lib/x86_64-linux-gnu/libcuda.so*:cuMemAlloc,
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cuMemAlloc,
+uprobe:/usr/lib64/libcuda.so*:cuMemAlloc
+{
+    // arg1 is size_t bytesize
+    @pending_alloc_size[tid] = arg1;
+}
+
+uretprobe:/lib/x86_64-linux-gnu/libcuda.so*:cuMemAlloc,
+uretprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cuMemAlloc,
+uretprobe:/usr/lib64/libcuda.so*:cuMemAlloc
+{
+    $size = @pending_alloc_size[tid];
+    if ($size > 0 && retval == 0) {  // Success
+        @total_memory_allocated += $size;
+        @memory_allocations++;
+
+        $ts = (nsecs - @start_time) / 1000000.0;
+        printf("{\"event_id\":%d,\"ts\":%.6f,\"tid\":%d,\"type\":\"memory\",\"op\":\"alloc\",\"size\":%d,\"total_allocated\":%d}\n",
+               @event_id, $ts, tid, $size, @total_memory_allocated);
+        @event_id++;
+
+        delete(@pending_alloc_size[tid]);
+    }
+}
+
+//
+// MEMORY TRANSFER TRACKING
+//
+
+uprobe:/lib/x86_64-linux-gnu/libcuda.so*:cuMemcpyHtoD,
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cuMemcpyHtoD
+{
+    // arg2 is size_t ByteCount
+    @pending_transfer[tid] = arg2;
+    @transfer_direction[tid] = 1;  // H2D
+}
+
+uprobe:/lib/x86_64-linux-gnu/libcuda.so*:cuMemcpyDtoH,
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cuMemcpyDtoH
+{
+    @pending_transfer[tid] = arg2;
+    @transfer_direction[tid] = 2;  // D2H
+}
+
+uprobe:/lib/x86_64-linux-gnu/libcuda.so*:cuMemcpyDtoD,
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cuMemcpyDtoD
+{
+    @pending_transfer[tid] = arg2;
+    @transfer_direction[tid] = 3;  // D2D
+}
+
+uretprobe:/lib/x86_64-linux-gnu/libcuda.so*:cuMemcpy*,
+uretprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cuMemcpy*
+/@pending_transfer[tid]/
+{
+    $size = @pending_transfer[tid];
+    $dir = @transfer_direction[tid];
+    $entry = @entry_ts[tid, probe];
+    $duration = (nsecs - $entry) / 1000000.0;  // milliseconds
+
+    if ($size > 0 && retval == 0 && $duration > 0) {
+        $bandwidth = ($size / $duration) / 1000.0;  // GB/s
+
+        $dir_str = $dir == 1 ? "H2D" : ($dir == 2 ? "D2H" : "D2D");
+
+        $ts = (nsecs - @start_time) / 1000000.0;
+        printf("{\"event_id\":%d,\"ts\":%.6f,\"tid\":%d,\"type\":\"transfer\",\"direction\":\"%s\",\"size\":%d,\"duration_ms\":%.3f,\"bandwidth_gbps\":%.2f}\n",
+               @event_id, $ts, tid, $dir_str, $size, $duration, $bandwidth);
+        @event_id++;
+
+        @total_transferred += $size;
+        @transfer_count++;
+
+        delete(@pending_transfer[tid]);
+        delete(@transfer_direction[tid]);
+    }
+}
+
+//
+// KERNEL LAUNCH TRACKING
+//
+
+uprobe:/lib/x86_64-linux-gnu/libcuda.so*:cuLaunchKernel,
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so*:cuLaunchKernel
+{
+    // arg1-arg6 are grid and block dimensions
+    $gridX = arg1;
+    $gridY = arg2;
+    $gridZ = arg3;
+    $blockX = arg4;
+    $blockY = arg5;
+    $blockZ = arg6;
+
+    $total_blocks = $gridX * $gridY * $gridZ;
+    $total_threads = $total_blocks * $blockX * $blockY * $blockZ;
+
+    $ts = (nsecs - @start_time) / 1000000.0;
+    printf("{\"event_id\":%d,\"ts\":%.6f,\"tid\":%d,\"type\":\"kernel\",\"op\":\"launch\",\"grid\":[%d,%d,%d],\"block\":[%d,%d,%d],\"threads\":%d}\n",
+           @event_id, $ts, tid, $gridX, $gridY, $gridZ, $blockX, $blockY, $blockZ, $total_threads);
+    @event_id++;
+
+    @kernel_launches++;
+}
+
+//
+// KERNEL SPACE HOOKS - nvidia.ko driver
+//
+// These trace the kernel driver functions that handle CUDA operations
+// Note: Function names may vary by driver version, use wildcards
+
+// IOCTL handler - entry point from userspace to kernel
+kprobe:nvidia_ioctl,
+kprobe:nv_ioctl
+{
+    $event_id = @event_id;
+    @event_id++;
+
+    @ioctl_entry[tid] = nsecs;
+
+    $ts = (nsecs - @start_time) / 1000000.0;
+
+    // arg0 = file, arg1 = cmd, arg2 = arg
+    $cmd = arg1;
+
+    printf("{\"event_id\":%d,\"ts\":%.6f,\"tid\":%d,\"phase\":\"B\",\"type\":\"kernel\",\"name\":\"%s\",\"ioctl_cmd\":%d}\n",
+           $event_id, $ts, tid, probe, $cmd);
+
+    @ioctl_calls++;
+}
+
+kretprobe:nvidia_ioctl,
+kretprobe:nv_ioctl
+{
+    $entry = @ioctl_entry[tid];
+
+    if ($entry > 0) {
+        $event_id = @event_id;
+        @event_id++;
+
+        $duration = (nsecs - $entry) / 1000.0;  // microseconds
+        $ts = (nsecs - @start_time) / 1000000.0;
+
+        printf("{\"event_id\":%d,\"ts\":%.6f,\"tid\":%d,\"phase\":\"E\",\"type\":\"kernel\",\"name\":\"%s\",\"duration_us\":%.3f,\"retval\":%d}\n",
+               $event_id, $ts, tid, probe, $duration, retval);
+
+        @total_ioctl_time += $duration;
+
+        delete(@ioctl_entry[tid]);
+    }
+}
+
+// GPU memory operations in kernel
+kprobe:nv_mem_alloc,
+kprobe:os_alloc_mem
+{
+    $ts = (nsecs - @start_time) / 1000000.0;
+    printf("{\"event_id\":%d,\"ts\":%.6f,\"tid\":%d,\"type\":\"kernel_memory\",\"op\":\"alloc\"}\n",
+           @event_id, $ts, tid);
+    @event_id++;
+}
+
+// GPU scheduler functions (names may vary)
+kprobe:nv_schedule_work,
+kprobe:nv_kthread_q_schedule_q_item
+{
+    $ts = (nsecs - @start_time) / 1000000.0;
+    printf("{\"event_id\":%d,\"ts\":%.6f,\"tid\":%d,\"type\":\"scheduler\",\"op\":\"schedule_work\"}\n",
+           @event_id, $ts, tid);
+    @event_id++;
+
+    @scheduler_calls++;
+}
+
+//
+// SYSTEM CALL TRACING - Bridge between userspace and kernel
+//
+
+tracepoint:syscalls:sys_enter_ioctl
+/comm == "python" || comm == "python3"/
+{
+    // Check if this is an NVIDIA ioctl
+    // File descriptors for /dev/nvidia* are typically in a certain range
+    // We can filter by checking the ioctl command
+
+    $fd = args->fd;
+    $cmd = args->cmd;
+
+    // NVIDIA ioctl commands typically start with 'N' (0x4E)
+    // This is a heuristic - adjust as needed
+    $is_nvidia = ($cmd >> 8) == 0x46 || ($cmd >> 8) == 0x4E;
+
+    if ($is_nvidia) {
+        $ts = (nsecs - @start_time) / 1000000.0;
+        printf("{\"event_id\":%d,\"ts\":%.6f,\"tid\":%d,\"type\":\"syscall\",\"name\":\"ioctl\",\"fd\":%d,\"cmd\":%u}\n",
+               @event_id, $ts, tid, $fd, $cmd);
+        @event_id++;
+
+        @syscall_ioctl++;
+    }
+}
+
+//
+// SUMMARY AND CLEANUP
+//
+
+END {
+    printf("\n");
+    printf("=== TRACE SUMMARY ===\n\n");
+
+    $total_time = (nsecs - @start_time) / 1000000000.0;  // seconds
+    printf("Total trace duration: %.3f seconds\n\n", $total_time);
+
+    printf("USERSPACE (libcuda.so):\n");
+    printf("  Total CUDA API calls: %d\n", @userspace_calls);
+    printf("  Kernel launches: %d\n", @kernel_launches);
+    printf("  Memory allocations: %d\n", @memory_allocations);
+    printf("  Total memory allocated: %d bytes (%.2f MB)\n",
+           @total_memory_allocated, @total_memory_allocated / 1048576.0);
+    printf("  Memory transfers: %d\n", @transfer_count);
+    printf("  Total data transferred: %d bytes (%.2f MB)\n\n",
+           @total_transferred, @total_transferred / 1048576.0);
+
+    printf("KERNEL SPACE (nvidia.ko):\n");
+    printf("  IOCTL calls: %d\n", @ioctl_calls);
+    printf("  Total IOCTL time: %.3f ms\n", @total_ioctl_time / 1000.0);
+    printf("  Scheduler calls: %d\n", @scheduler_calls);
+    printf("  Syscall ioctl count: %d\n\n", @syscall_ioctl);
+
+    printf("TOP 20 FUNCTIONS BY CALL COUNT:\n");
+    print(@call_count, 20);
+
+    printf("\nTOP 20 FUNCTIONS BY TOTAL TIME:\n");
+    print(@total_time, 20);
+
+    printf("\nAVERAGE TIME PER CALL (top 20):\n");
+    clear(@avg_time);
+    map(@avg_time, @total_time / @call_count);
+    print(@avg_time, 20);
+
+    // Cleanup
+    clear(@entry_ts);
+    clear(@depth);
+    clear(@call_count);
+    clear(@total_time);
+    clear(@avg_time);
+    clear(@ioctl_entry);
+    clear(@pending_alloc_size);
+    clear(@pending_transfer);
+    clear(@transfer_direction);
+}
+
+// Error handling
+interval:s:5 {
+    printf("# Heartbeat: %d events captured\n", @event_id);
+}

@@ -1,0 +1,210 @@
+# vLLM Deployment with eBPF Tracing Sidecar
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama2-traced
+  namespace: vllm-tracing
+  labels:
+    app: vllm
+    model: llama2-7b
+    component: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+      model: llama2-7b
+  template:
+    metadata:
+      labels:
+        app: vllm
+        model: llama2-7b
+        component: inference
+    spec:
+      # CRITICAL: Share host PID namespace so sidecar can attach to vLLM process
+      hostPID: true
+
+      serviceAccountName: vllm-tracer
+
+      # Node selector to ensure GPU node placement
+      nodeSelector:
+        nvidia.com/gpu: "true"
+
+      # Tolerations for GPU nodes
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      # Init container to prepare directories
+      initContainers:
+        - name: prepare-traces
+          image: busybox:latest
+          command: ['sh', '-c', 'mkdir -p /traces && chmod 777 /traces']
+          volumeMounts:
+            - name: traces
+              mountPath: /traces
+
+      containers:
+        # Main vLLM inference server
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          command:
+            - python3
+            - -m
+            - vllm.entrypoints.openai.api_server
+            - --model
+            - meta-llama/Llama-2-7b-hf
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8000"
+            - --dtype
+            - float16
+            - --max-model-len
+            - "2048"
+            - --gpu-memory-utilization
+            - "0.9"
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+          env:
+            # Hugging Face token (required for Llama-2)
+            # Set via kubectl create secret generic hf-token --from-literal=token=YOUR_TOKEN
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+            # CUDA settings
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: CUDA_LAUNCH_BLOCKING
+              value: "0"
+          resources:
+            requests:
+              nvidia.com/gpu: 1
+              memory: "12Gi"
+              cpu: "4"
+            limits:
+              nvidia.com/gpu: 1
+              memory: "16Gi"
+              cpu: "8"
+          volumeMounts:
+            - name: traces
+              mountPath: /traces
+            - name: shm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+        # eBPF tracing sidecar
+        - name: ebpf-tracer
+          image: littleboy/ebpf-cuda-tracer:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            # CRITICAL: Privileged mode required for eBPF
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - SYS_PTRACE
+                - SYS_RESOURCE
+                - NET_ADMIN
+                - IPC_LOCK
+          env:
+            # Target process configuration
+            - name: TARGET_PROCESS
+              value: "python"
+            # S3 upload configuration
+            - name: S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: vllm-tracing-config
+                  key: S3_BUCKET
+            - name: S3_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: vllm-tracing-config
+                  key: S3_PREFIX
+            - name: TRACE_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: vllm-tracing-config
+                  key: TRACE_INTERVAL
+            - name: UPLOAD_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: vllm-tracing-config
+                  key: UPLOAD_ENABLED
+            - name: TRACE_DIR
+              value: "/traces"
+            # AWS credentials (use instance profile or IRSA)
+            - name: AWS_REGION
+              value: "us-east-1"
+          volumeMounts:
+            - name: traces
+              mountPath: /traces
+            # Mount host sys and debug for eBPF
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+          livenessProbe:
+            exec:
+              command:
+                - test
+                - -f
+                - /tmp/tracer-healthy
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+      volumes:
+        # Shared volume for trace files
+        - name: traces
+          persistentVolumeClaim:
+            claimName: vllm-traces
+        # Shared memory for vLLM (required for tensor parallel)
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+        # Host mounts for eBPF
+        - name: sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+            type: Directory
+
+      # DNS settings for better resolution
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always

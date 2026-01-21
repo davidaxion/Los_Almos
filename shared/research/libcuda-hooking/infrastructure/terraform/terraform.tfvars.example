@@ -1,0 +1,32 @@
+# LittleBoy Research Instance Configuration
+# Copy this file to terraform.tfvars and customize
+
+# AWS Region (check GPU availability: us-west-2, us-east-1, eu-west-1)
+aws_region = "us-west-2"
+
+# Instance Type
+# - g4dn.xlarge:  T4 GPU, 4 vCPUs, 16GB RAM  (~$0.52/hr)
+# - g4dn.2xlarge: T4 GPU, 8 vCPUs, 32GB RAM  (~$0.75/hr)
+# - g5.xlarge:    A10G GPU, 4 vCPUs, 16GB RAM (~$1.01/hr)
+instance_type = "g4dn.xlarge"
+
+# Root Volume Size (GB) - need space for models
+root_volume_size = 150
+
+# Your IP for SSH access (IMPORTANT: Set this to your IP!)
+# Get your IP: curl ifconfig.me
+allowed_ssh_cidrs = ["0.0.0.0/0"]  # CHANGE THIS!
+
+# SSH Key Paths
+ssh_public_key_path  = "~/.ssh/littleboy_research.pub"
+ssh_private_key_path = "~/.ssh/littleboy_research"
+
+# Use Elastic IP (recommended)
+use_elastic_ip = true
+
+# Optional: GitHub repo to clone
+# github_repo_url = "https://github.com/yourusername/LittleBoy.git"
+github_repo_url = ""
+
+# Optional: Setup Jupyter notebook
+setup_jupyter = false

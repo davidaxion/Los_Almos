@@ -1,0 +1,285 @@
+#cloud-config
+# Cloud-init configuration for LittleBoy Research Instance
+# Installs NVIDIA drivers, CUDA, PyTorch, eBPF tools, and sets up tracing environment
+
+package_update: true
+package_upgrade: true
+
+packages:
+  # Build essentials
+  - build-essential
+  - linux-headers-generic
+  - pkg-config
+  - software-properties-common
+
+  # eBPF and tracing tools
+  - bpftrace
+  - bpfcc-tools
+  - python3-bpfcc
+  - linux-tools-common
+  - linux-tools-generic
+
+  # Python development
+  - python3-pip
+  - python3-dev
+  - python3-venv
+
+  # System utilities
+  - htop
+  - nvtop
+  - tmux
+  - vim
+  - git
+  - curl
+  - wget
+  - jq
+  - tree
+
+  # Development tools
+  - gcc
+  - g++
+  - make
+  - cmake
+
+# Disable automatic updates during setup
+bootcmd:
+  - systemctl stop apt-daily.timer
+  - systemctl stop apt-daily-upgrade.timer
+
+runcmd:
+  # === NVIDIA Driver and CUDA Setup ===
+  - echo "=== Installing NVIDIA Driver and CUDA ==="
+
+  # Install NVIDIA driver
+  - apt-get install -y ubuntu-drivers-common
+  - ubuntu-drivers install --gpgpu
+
+  # Wait for driver to be ready
+  - sleep 10
+
+  # Add NVIDIA CUDA repository
+  - wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+  - dpkg -i cuda-keyring_1.1-1_all.deb
+  - apt-get update
+
+  # Install CUDA toolkit
+  - apt-get install -y cuda-toolkit-12-3
+
+  # Set up CUDA environment
+  - echo 'export PATH=/usr/local/cuda/bin:$PATH' >> /etc/profile.d/cuda.sh
+  - echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> /etc/profile.d/cuda.sh
+  - chmod +x /etc/profile.d/cuda.sh
+
+  # === Python Environment Setup ===
+  - echo "=== Setting up Python Environment ==="
+
+  # Upgrade pip
+  - python3 -m pip install --upgrade pip setuptools wheel
+
+  # Install PyTorch with CUDA support
+  - pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+  # Install transformers and ML libraries
+  - pip3 install transformers accelerate datasets
+  - pip3 install numpy scipy matplotlib jupyter ipython
+
+  # Install BCC Python bindings (for advanced eBPF tracing)
+  - pip3 install bcc
+
+  # === eBPF Tools Setup ===
+  - echo "=== Configuring eBPF Tools ==="
+
+  # Enable kernel tracing
+  - mount -t debugfs debugfs /sys/kernel/debug || true
+  - echo 'debugfs /sys/kernel/debug debugfs defaults 0 0' >> /etc/fstab
+
+  # Set permissions for tracing
+  - chmod 755 /sys/kernel/debug
+  - chmod 755 /sys/kernel/debug/tracing
+
+  # === Create Research User Setup ===
+  - echo "=== Setting up Research Environment ==="
+
+  # Create workspace directory
+  - mkdir -p /home/ubuntu/littleboy-research
+  - chown ubuntu:ubuntu /home/ubuntu/littleboy-research
+
+  # Create traces directory
+  - mkdir -p /home/ubuntu/littleboy-research/traces
+  - chown ubuntu:ubuntu /home/ubuntu/littleboy-research/traces
+
+  # === Clone or Copy LittleBoy Code ===
+%{ if github_repo_url != "" ~}
+  - echo "=== Cloning GitHub Repository ==="
+  - su - ubuntu -c "cd /home/ubuntu/littleboy-research && git clone ${github_repo_url} repo"
+%{ else ~}
+  - echo "=== Creating placeholder for LittleBoy code ==="
+  - mkdir -p /home/ubuntu/littleboy-research/code
+  - chown ubuntu:ubuntu /home/ubuntu/littleboy-research/code
+%{ endif ~}
+
+%{ if setup_jupyter ~}
+  # === Jupyter Setup ===
+  - echo "=== Setting up Jupyter Notebook ==="
+  - pip3 install jupyter notebook jupyterlab
+
+  # Generate Jupyter config
+  - su - ubuntu -c "jupyter notebook --generate-config"
+
+  # Set Jupyter to listen on all interfaces
+  - su - ubuntu -c "echo \"c.NotebookApp.ip = '0.0.0.0'\" >> ~/.jupyter/jupyter_notebook_config.py"
+  - su - ubuntu -c "echo \"c.NotebookApp.open_browser = False\" >> ~/.jupyter/jupyter_notebook_config.py"
+  - su - ubuntu -c "echo \"c.NotebookApp.port = 8888\" >> ~/.jupyter/jupyter_notebook_config.py"
+
+  # Create systemd service for Jupyter
+  - |
+    cat > /etc/systemd/system/jupyter.service <<EOF
+    [Unit]
+    Description=Jupyter Notebook Server
+    After=network.target
+
+    [Service]
+    Type=simple
+    User=ubuntu
+    WorkingDirectory=/home/ubuntu/littleboy-research
+    ExecStart=/usr/local/bin/jupyter notebook
+    Restart=on-failure
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+
+  - systemctl daemon-reload
+  - systemctl enable jupyter
+  - systemctl start jupyter
+%{ endif ~}
+
+  # === Create Helper Scripts ===
+  - echo "=== Creating Helper Scripts ==="
+
+  # GPU status script
+  - |
+    cat > /usr/local/bin/gpu-status <<'EOF'
+    #!/bin/bash
+    echo "=== GPU Information ==="
+    nvidia-smi
+    echo ""
+    echo "=== CUDA Version ==="
+    nvcc --version
+    echo ""
+    echo "=== PyTorch CUDA Check ==="
+    python3 -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'CUDA Version: {torch.version.cuda}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+    EOF
+  - chmod +x /usr/local/bin/gpu-status
+
+  # Quick trace script
+  - |
+    cat > /usr/local/bin/quick-trace <<'EOF'
+    #!/bin/bash
+    if [ "$#" -eq 0 ]; then
+        echo "Usage: sudo quick-trace <command>"
+        echo "Example: sudo quick-trace python test.py"
+        exit 1
+    fi
+
+    TRACE_DIR="/home/ubuntu/littleboy-research/traces"
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    TRACE_FILE="$TRACE_DIR/trace_$TIMESTAMP.jsonl"
+
+    echo "Starting trace... Output: $TRACE_FILE"
+    echo ""
+
+    bpftrace -e '
+    uprobe:/usr/local/cuda/lib64/libcuda.so:cu*,
+    uprobe:/lib/*/libcuda.so*:cu* {
+        printf("{\"ts\":%.9f,\"name\":\"%s\"}\n", (nsecs - @start) / 1e9, probe);
+    }
+    BEGIN { @start = nsecs; printf("Tracing CUDA calls...\n"); }
+    ' -o "$TRACE_FILE" &
+
+    TRACE_PID=$!
+    sleep 2
+
+    # Run command
+    "$@"
+
+    # Stop trace
+    kill -INT $TRACE_PID
+    wait $TRACE_PID 2>/dev/null || true
+
+    echo ""
+    echo "Trace complete: $TRACE_FILE"
+    chown ubuntu:ubuntu "$TRACE_FILE"
+    EOF
+  - chmod +x /usr/local/bin/quick-trace
+
+  # === Create Welcome Message ===
+  - |
+    cat > /etc/motd <<'EOF'
+
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║                  LittleBoy Research Instance                  ║
+    ║                 GPU Tracing & Inference Testing               ║
+    ╚═══════════════════════════════════════════════════════════════╝
+
+    Quick Commands:
+      gpu-status          - Show GPU and CUDA information
+      sudo quick-trace    - Quick CUDA trace wrapper
+      nvtop               - GPU monitoring (like htop for GPU)
+      nvidia-smi          - NVIDIA GPU stats
+
+    Directories:
+      ~/littleboy-research/        - Main workspace
+      ~/littleboy-research/traces/ - Trace output directory
+
+    eBPF Tracing:
+      sudo bpftrace <script>  - Run bpftrace script
+      sudo -i                 - Get root shell for tracing
+
+    Setup Status:
+      Check: tail -f /var/log/cloud-init-output.log
+
+    ═══════════════════════════════════════════════════════════════
+    EOF
+
+  # === Final Verification ===
+  - echo "=== Verifying Installation ==="
+
+  # Test NVIDIA driver
+  - nvidia-smi || echo "WARNING: nvidia-smi failed"
+
+  # Test CUDA
+  - nvcc --version || echo "WARNING: nvcc not found"
+
+  # Test PyTorch
+  - python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available in PyTorch'" || echo "WARNING: PyTorch CUDA check failed"
+
+  # Test bpftrace
+  - bpftrace --version || echo "WARNING: bpftrace not found"
+
+  # === Completion ===
+  - echo "=== Setup Complete ==="
+  - echo "Instance ready for LittleBoy research!"
+  - echo "Timestamp: $(date)"
+
+  # Write completion marker
+  - touch /var/lib/cloud/instance/setup-complete
+  - echo "Setup completed at $(date)" > /home/ubuntu/SETUP_COMPLETE.txt
+  - chown ubuntu:ubuntu /home/ubuntu/SETUP_COMPLETE.txt
+
+final_message: |
+  ╔═══════════════════════════════════════════════════════════════╗
+  ║            LittleBoy Research Instance Ready!                 ║
+  ╚═══════════════════════════════════════════════════════════════╝
+
+  Setup complete! You can now:
+    1. SSH into the instance
+    2. Run: gpu-status (to verify GPU)
+    3. Start tracing CUDA workloads
+
+  Check /var/log/cloud-init-output.log for full setup log.
+
+power_state:
+  mode: reboot
+  timeout: 300
+  condition: true
